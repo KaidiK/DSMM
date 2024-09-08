@@ -1,0 +1,457 @@
+---
+title: "6 - Subgroup analyses"
+author: "Kaidi Kang"
+date: "2024-04-19"
+output:     
+  bookdown::html_document2:
+      toc: true
+      number_sections: true
+      fig_caption: TRUE
+      toc_float: 
+        collapsed: false
+      code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = FALSE, warning = FALSE}
+# LIBRARIES
+library(magrittr)
+# require(Hmisc)
+library(rms)
+library(table1)
+# library(ggplot2)
+library("dplyr")
+# library(viridis)
+library(nlme)
+# library(pBrackets)
+library(splines)
+library(simplecolors)
+
+library(readr)
+# for bayesian estimation
+library(brms)
+library(mvtnorm)
+library(rstan)
+library(StanHeaders)
+library(bayesplot) # for bayesian diagnostics
+```
+
+```{r, eval = FALSE}
+getwd()
+setwd("~/collaborations/temp")
+# mdoel fit function
+data = read_csv("Data/clean_all_studies_DSMM_2024Feb.csv")
+outcome = c("MEM", "LAN", "EXF")
+n_iter = 4000
+
+study_exclude = "A4"
+
+# SMM
+
+file_name_smm = paste0("NEW_ALL_", outcome, "_smm", "_iter", n_iter, ".rds")
+
+smm_exist = file.exists(file.path("objects", "overall", file_name_smm))
+
+if (smm_exist){
+  
+  # if the file exists, readin the file
+  smm_fit = readRDS(paste0("objects/overall/", file_name_smm))
+  
+} else {
+  
+  # otherwise, fit the model
+  
+  # data
+  dat_smm = subset(data, !Study %in% study_exclude)
+  dat_smm = subset(dat_smm, AD_conv == 1)
+  dat_smm = dat_smm[order(dat_smm$Study, dat_smm$subj_id, dat_smm$Age), ]
+  
+  prior_spec <- prior(normal(0, 1), nlpar = "theta0") + 
+    prior(normal(0, 1), nlpar = "theta1") + 
+    prior(normal(0, 1), nlpar = "tau")
+  
+  set.seed(2024)
+  
+  smm_fit <- brm(bf( eval(parse(text = paste0(outcome, " ~ theta0 - theta1/( 1 + exp( tau - time_to_AD ) )"))) , 
+                     theta0 ~ 1 + (1||Study/subj_id),
+                     theta1 ~ 1 + (1||Study/subj_id),
+                     tau ~ 1 + (1||Study/subj_id),
+                     nl = TRUE),
+                 data = dat_smm, 
+                 prior = prior_spec,
+                 chain = 1,
+                 thin = 5,
+                 iter = n_iter,
+                 save_pars = save_pars(all = TRUE)
+                 # , silent = 2, refresh = 0
+  )
+  
+  saveRDS(smm_fit, paste0("objects/overall/ALL_", outcome, "_smm_iter", n_iter, ".rds"))
+  
+}
+
+Sys.time()
+# DSMM 
+# Data for DSMM model
+dat_dsmm = subset(data, !Study %in% study_exclude)
+dat_dsmm = subset(dat_dsmm,  I_MCI == 1 | I_AD == 1)
+dat_dsmm = dat_dsmm[order(dat_dsmm$Study, dat_dsmm$subj_id, dat_dsmm$Age), ]
+
+# remove subjects with reverted diagnoses from AD to an earlier stage
+dat_dsmm = subset(dat_dsmm, retro_AD2MCI == 0 & retro_AD2NC == 0 )
+
+# derive the new time variable: time to `event`
+dat_dsmm$t_event = dat_dsmm$time_to_AD
+## (only) MCI convertors (time to MCI conv)
+dat_dsmm$t_event[dat_dsmm$MCI_conv == 1] = dat_dsmm$time_to_MCI[dat_dsmm$MCI_conv == 1]
+## only-AD convertors
+dat_dsmm$t_event[dat_dsmm$AD_conv == 1] = dat_dsmm$time_to_AD[dat_dsmm$AD_conv == 1]
+## double convertors (time to MCI)
+dat_dsmm$t_event[dat_dsmm$double_conv == 1] = dat_dsmm$time_to_MCI[dat_dsmm$double_conv == 1]
+
+# derive the age at event
+dat_dsmm$age_event = dat_dsmm$AD_age
+## MCI convertors: age at MCI conv
+dat_dsmm$age_event[dat_dsmm$MCI_conv == 1] = dat_dsmm$MCI_age[dat_dsmm$MCI_conv == 1]
+## AD convertors: age at AD conv
+dat_dsmm$age_event[dat_dsmm$AD_conv == 1] = dat_dsmm$AD_age[dat_dsmm$AD_conv == 1]
+## double convertors: age at MCI conv
+dat_dsmm$age_event[dat_dsmm$double_conv == 1] = dat_dsmm$MCI_age[dat_dsmm$double_conv == 1]
+
+# re-define gender - binary variable
+dat_dsmm$gender = ifelse(dat_dsmm$Sex == "Male", 1, 0)
+
+# centering age at MCI conversion at 77 (the median MCI age in the sample)
+dat_dsmm$age_event77 = dat_dsmm$age_event - 77
+
+# Race
+dat_dsmm$Race %<>% factor(levels = c("Non-Hispanic White", "Non-Hispanic Black", "Other"))
+
+
+# note: change the I_MCI to 0 for those with both intial MCI and AD onsets, but with missing APOE carrier status, in order to prevent them from being included in the estimation of model D and, therefore, excluded from automatically by the R function due to missingness.
+dat_dsmm$I_MCI[is.na(dat_dsmm$apoe4pos) & dat_dsmm$dx_seq == "NC-MCI-AD"] = 0
+
+
+# input missing values for `apoe4pos` and `gender` for subjects with I_MCI = 0
+dat_dsmm$apoe4pos[is.na(dat_dsmm$apoe4pos) & dat_dsmm$I_MCI == 0] = 0.5
+dat_dsmm$gender[is.na(dat_dsmm$gender) & dat_dsmm$I_MCI == 0] = 0.5
+
+
+# Define DSMM (Sigmoid) functions
+
+beta_smm = summary(smm_fit)$fixed %>% round(2) %>% suppressWarnings()
+
+prior_spec <- eval(parse(text = paste0(
+  "prior(normal(", beta_smm["theta0_Intercept", "Estimate"], ",", beta_smm["theta0_Intercept", "Est.Error"], "), nlpar = 'theta0') +  
+  prior(normal(", beta_smm["theta1_Intercept", "Estimate"], ",",  beta_smm["theta1_Intercept", "Est.Error"], "), nlpar = 'theta1') + 
+  prior(normal(", beta_smm["tau_Intercept", "Estimate"], ",", beta_smm["tau_Intercept", "Est.Error"], "), nlpar = 'tau') + 
+  prior(normal(0, 1), nlpar = 'logD')"
+)
+))
+
+# prior_spec <- prior(normal(0, 1), nlpar = "theta0") +
+#               prior(normal(0, 1), nlpar = "theta1") +
+#               prior(normal(0, 1), nlpar = "tau") +
+#               prior(normal(0, 1), nlpar = "logD")
+time0 = Sys.time()
+
+set.seed(2024)
+dsmm_fit <- brm(bf( eval(parse(text = paste0(outcome, " ~ theta0 - theta1/( 1 + exp( tau - (t_event - I_MCI * exp(logD) )))"))) , 
+                    theta0 ~ apoe4pos + gender + Race + (1||Study/subj_id),
+                    theta1 ~ apoe4pos + gender + Race + (1||Study/subj_id),
+                    tau ~ apoe4pos + gender + Race + (1||Study/subj_id),
+                    logD ~ apoe4pos + gender + ns(age_event77, 3) + apoe4pos:gender + apoe4pos:ns(age_event77, 3) + (1||Study/subj_id),
+                    nl = TRUE),
+                data = dat_dsmm, 
+                prior = prior_spec,
+                chains = 1,
+                thin = 5,
+                iter = n_iter,
+                save_pars = save_pars(all = TRUE)
+                # , silent = 2, refresh = 0
+)
+
+saveRDS(dsmm_fit, paste0("objects/overall/subgroup_", outcome, "_dsmm_iter", n_iter, ".rds"))
+
+
+time1 = Sys.time()
+
+t_elapse = time1 - time0
+print(t_elapse)
+
+```
+
+
+# Results
+## Binary race variable & main effects only
+### Memory
+```{r}
+fit <- readRDS("objects/overall/subgroup_binary_raceMEM_dsmm_iter4000.rds")
+obj = summary(fit)
+saveRDS(obj, "objects/overall/summary_subgroup_MEM.rds")
+obj
+
+```
+
+### Language 
+```{r}
+fit <- readRDS("objects/overall/subgroup_binary_raceLAN_dsmm_iter4000.rds")
+obj = summary(fit)
+saveRDS(obj, "objects/overall/summary_subgroup_LAN.rds")
+obj
+```
+
+### Executive Function
+```{r}
+fit <- readRDS("objects/overall/subgroup_binary_raceEXF_dsmm_iter4000.rds")
+obj = summary(fit)
+saveRDS(obj, "objects/overall/summary_subgroup_EXF.rds")
+obj
+
+```
+
+### Temporal orders
+```{r, fig.width= 8, fig.height = 4}
+t = seq(-8, 4, by = 0.1)
+gender = 0:1
+apoe = 0:1
+race = c("White", "Other")
+
+sig_mod <- function(t_AD, theta_0, theta_1, mid_time) {
+    theta_0 - theta_1/( 1 + exp( mid_time - t_AD ) )
+}
+  
+plot_data = list()
+
+for (outcome in c("MEM", "LAN", "EXF")){
+  
+  obj = file.path("objects", "overall", list.files(path = "objects/overall", pattern = paste0("subgroup_binary_race", outcome, "_dsmm"))) %>% readRDS()
+
+  # expected outcome value
+  beta = summary(obj)$fixed
+  beta_theta0 = lapply(strsplit(rownames(beta), "_"), FUN = function(x) x[1] == "theta0") %>% unlist
+  beta_theta1 = lapply(strsplit(rownames(beta), "_"), FUN = function(x) x[1] == "theta1") %>% unlist
+  beta_tau = lapply(strsplit(rownames(beta), "_"), FUN = function(x) x[1] == "tau") %>% unlist
+  
+  beta_theta0_hat = beta$Estimate[beta_theta0] %>% c()
+  beta_theta1_hat =  beta$Estimate[beta_theta1] %>% c()
+  beta_tau_hat = beta$Estimate[beta_tau] %>% c()
+  
+  # design matrix
+  dat_X = expand.grid(int = 1, apoe = apoe, gender = gender, race = race)
+  dat_X$race_other = ifelse(dat_X$race == "Other", 1, 0)
+  X = dat_X[, -4]
+  X %<>% as.matrix()
+  
+  dat_X$theta0_hat = X %*% beta_theta0_hat %>% c()
+  dat_X$theta1_hat = X %*% beta_theta1_hat %>% c()
+  dat_X$tau_hat = X %*% beta_tau_hat %>% c()
+  
+  # use bootstrapping to derive the confidence band
+  i = 1
+  out = list()
+  nboot = 1000
+  for (i in 1:nrow(dat_X)){
+    temp_X = X[i, ] %>% matrix(nrow = 1)
+    big_X = Matrix::bdiag(c(X[i, ]), c(X[i, ]), c(X[i, ])) %>% as.matrix %>% t()
+    Sigma = big_X %*% vcov(obj)[1:ncol(big_X), 1:ncol(big_X)] %*% t(big_X)
+    boot_curves = MASS::mvrnorm(n = nboot, mu = c(dat_X$theta0_hat[i], dat_X$theta1_hat[i], dat_X$tau_hat[i]), Sigma = Sigma)
+    boot_val = lapply(1:nboot, function(x){
+                     # bootstrapped theta0
+                     b0 = boot_curves[x, 1]
+                     # bootstrapped theta1
+                     b1 = boot_curves[x, 2]
+                     # bootstrapped tau
+                     b2 = boot_curves[x, 3]
+                     boot_y = lapply(t, FUN = function(a) {sig_mod(a, theta_0 = b0, theta_1 = b1, mid_time = b2)}) %>% unlist
+                     return(boot_y)
+                    })
+    boot_val = do.call(cbind, boot_val)
+    boot_CI = apply(boot_val, 1, FUN = function(x){ quantile(x, probs = c(0.025, 0.975)) })
+    boot_CI = t(boot_CI) %>% as.data.frame()
+    colnames(boot_CI) = c("ll", "ul")
+    boot_CI = cbind(t, boot_CI)
+    boot_res = merge(dat_X[i, ] %>% as.data.frame(), boot_CI, by=character(0))
+    boot_res$Ey = sig_mod(t_AD = boot_res$t, 
+                       theta_0 = boot_res$theta0_hat,
+                       theta_1 =  boot_res$theta1_hat,
+                       mid_time =  boot_res$tau_hat
+                       )
+    out[[i]] = boot_res
+  }
+  
+  out = do.call(rbind, out)
+  
+  out$outcome = outcome
+  plot_data[[outcome]] = out
+}
+
+plot_data = do.call(rbind, plot_data)
+
+plot_data$apoe %<>% factor(levels = 0:1, labels = c("Non-carrier", "Carrier"))
+plot_data$gender %<>% factor(levels = 0:1, labels = c("Female", "Male"))
+plot_data$Marker = factor(plot_data$outcome, levels = c("MEM", "LAN", "EXF"), labels = c("Memory", "Language", "Executive function"))
+```
+
+```{r, fig.width= 12, fig.height = 6}
+library(ggh4x) # for nested facet labels
+
+plot_data$race_label = plot_data$race
+plot_data$race_label %<>% factor(labels = c("Race: White", "Race: non-White"))
+ 
+plot_data$apoe_label = plot_data$apoe
+plot_data$apoe_label %<>% factor(labels = c("APOE-e4: non-carrier", "APOE-e4: carrier"))
+ 
+# the code for figure 3 needs to be run first.
+P = ggplot() + 
+  geom_line(data = plot_data, aes(x = t, y = Ey, color = Marker), linewidth = 1) + 
+  geom_ribbon(data = plot_data, aes(x = t, ymin = ll, ymax = ul, fill = Marker), alpha = 0.1) + 
+  scale_x_continuous(breaks = seq(-6, 4, by = 2)) + # adding more tick marks
+  theme_bw() + 
+  geom_vline(xintercept = 0, linetype = 2) + 
+  facet_nested(race_label ~ apoe_label + gender ) + 
+  labs(title = "With main effects", y = "Harmonized cognitive measure", x = "Time to AD diagnosis", fill = "Cognitive domain", color = "Cognitive domain")
+
+P
+```
+
+
+
+## Binary race variable & with interaction effects
+### Memory
+```{r}
+fit <- readRDS("objects/overall/interaction_subgroup_MEM_dsmm_iter4000.rds")
+obj = summary(fit)
+saveRDS(obj, "objects/overall/summary_subgroup_interation_MEM.rds")
+obj
+
+```
+
+### Language 
+```{r}
+fit <- readRDS("objects/overall/interaction_subgroup_LAN_dsmm_iter4000.rds")
+obj = summary(fit)
+saveRDS(obj, "objects/overall/summary_subgroup_interation_LAN.rds")
+obj
+
+```
+
+### Executive Function
+```{r}
+fit <- readRDS("objects/overall/interaction_subgroup_EXF_dsmm_iter4000.rds")
+obj = summary(fit)
+saveRDS(obj, "objects/overall/summary_subgroup_interation_EXF.rds")
+obj
+```
+
+### Temporal orders
+```{r, fig.width= 8, fig.height = 4}
+t = seq(-8, 4, by = 0.1)
+gender = 0:1
+apoe = 0:1
+race = c("White", "Other")
+
+sig_mod <- function(t_AD, theta_0, theta_1, mid_time) {
+    theta_0 - theta_1/( 1 + exp( mid_time - t_AD ) )
+}
+  
+plot_data = list()
+
+for (outcome in c("MEM", "LAN", "EXF")){
+  
+  obj = file.path("objects", "overall", list.files(path = "objects/overall", pattern = paste0("interaction_subgroup_", outcome, "_dsmm"))) %>% readRDS()
+
+  # expected outcome value
+  beta = summary(obj)$fixed
+  beta_theta0 = lapply(strsplit(rownames(beta), "_"), FUN = function(x) x[1] == "theta0") %>% unlist
+  beta_theta1 = lapply(strsplit(rownames(beta), "_"), FUN = function(x) x[1] == "theta1") %>% unlist
+  beta_tau = lapply(strsplit(rownames(beta), "_"), FUN = function(x) x[1] == "tau") %>% unlist
+  
+  beta_theta0_hat = beta$Estimate[beta_theta0] %>% c()
+  beta_theta1_hat =  beta$Estimate[beta_theta1] %>% c()
+  beta_tau_hat = beta$Estimate[beta_tau] %>% c()
+  
+  # design matrix
+  dat_X = expand.grid(int = 1, apoe = apoe, gender = gender, race = race)
+  dat_X$race_other = ifelse(dat_X$race == "Other", 1, 0)
+  X = dat_X[, -4]
+  X$apoeXgender = X$apoe * X$gender 
+  X$apoeXrace = X$apoe * X$race_other
+  X$genderXrace = X$gender * X$race_other
+  X %<>% as.matrix()
+  
+  dat_X$theta0_hat = X %*% beta_theta0_hat %>% c()
+  dat_X$theta1_hat = X %*% beta_theta1_hat %>% c()
+  dat_X$tau_hat = X %*% beta_tau_hat %>% c()
+  
+  # use bootstrapping to derive the confidence band
+  i = 1
+  out = list()
+  nboot = 1000
+  for (i in 1:nrow(dat_X)){
+    temp_X = X[i, ] %>% matrix(nrow = 1)
+    big_X = Matrix::bdiag(c(X[i, ]), c(X[i, ]), c(X[i, ])) %>% as.matrix %>% t()
+    Sigma = big_X %*% vcov(obj)[1:ncol(big_X), 1:ncol(big_X)] %*% t(big_X)
+    boot_curves = MASS::mvrnorm(n = nboot, mu = c(dat_X$theta0_hat[i], dat_X$theta1_hat[i], dat_X$tau_hat[i]), Sigma = Sigma)
+    boot_val = lapply(1:nboot, function(x){
+                     # bootstrapped theta0
+                     b0 = boot_curves[x, 1]
+                     # bootstrapped theta1
+                     b1 = boot_curves[x, 2]
+                     # bootstrapped tau
+                     b2 = boot_curves[x, 3]
+                     boot_y = lapply(t, FUN = function(a) {sig_mod(a, theta_0 = b0, theta_1 = b1, mid_time = b2)}) %>% unlist
+                     return(boot_y)
+                    })
+    boot_val = do.call(cbind, boot_val)
+    boot_CI = apply(boot_val, 1, FUN = function(x){ quantile(x, probs = c(0.025, 0.975)) })
+    boot_CI = t(boot_CI) %>% as.data.frame()
+    colnames(boot_CI) = c("ll", "ul")
+    boot_CI = cbind(t, boot_CI)
+    boot_res = merge(dat_X[i, ] %>% as.data.frame(), boot_CI, by=character(0))
+    boot_res$Ey = sig_mod(t_AD = boot_res$t,
+                       theta_0 = boot_res$theta0_hat,
+                       theta_1 =  boot_res$theta1_hat,
+                       mid_time =  boot_res$tau_hat
+                       )
+    out[[i]] = boot_res
+  }
+
+  out = do.call(rbind, out)
+  
+  out$outcome = outcome
+  plot_data[[outcome]] = out
+}
+
+plot_data = do.call(rbind, plot_data)
+
+plot_data$apoe %<>% factor(levels = 0:1, labels = c("Non-carrier", "Carrier"))
+plot_data$gender %<>% factor(levels = 0:1, labels = c("Female", "Male"))
+plot_data$Marker = factor(plot_data$outcome, levels = c("MEM", "LAN", "EXF"), labels = c("Memory", "Language", "Executive function"))
+```
+
+```{r, fig.width= 12, fig.height = 6}
+library(ggh4x) # for nested facet labels
+
+plot_data$race_label = plot_data$race
+plot_data$race_label %<>% factor(labels = c("Race: White", "Race: non-White"))
+ 
+plot_data$apoe_label = plot_data$apoe
+plot_data$apoe_label %<>% factor(labels = c("APOE-e4: non-carrier", "APOE-e4: carrier"))
+ 
+# the code for figure 3 needs to be run first.
+P = ggplot() + 
+  geom_line(data = plot_data, aes(x = t, y = Ey, color = Marker), linewidth = 1) + 
+  geom_ribbon(data = plot_data, aes(x = t, ymin = ll, ymax = ul, fill = Marker), alpha = 0.1) + 
+  scale_x_continuous(breaks = seq(-6, 4, by = 2)) + # adding more tick marks
+  theme_bw() + 
+  geom_vline(xintercept = 0, linetype = 2) + 
+  facet_nested(race_label ~ apoe_label + gender ) + 
+  labs(title = "With interaction effects", y = "Harmonized cognitive measure", x = "Time to AD diagnosis", fill = "Cognitive domain", color = "Cognitive domain")
+
+P
+```
+
